@@ -1,0 +1,13 @@
+backend/venv/
+ml/venv/
+
+__pycache__/
+*.pyc
+
+node_modules/
+uploads/
+
+.vscode/
+.idea/
+
+bash.exe.stackdump
