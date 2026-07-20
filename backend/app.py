@@ -55,6 +55,23 @@ def predict():
 
         features = scaler.transform(features)
 
+        # ==========================
+        # CEK JARAK KE TETANGGA TERDEKAT
+        # Kalau gambar terlalu "asing" dibanding data training
+        # (misal bukan daun sama sekali), tolak prediksi.
+        # ==========================
+        distances, _ = model.kneighbors(features)
+        avg_distance = float(np.mean(distances))
+
+        DISTANCE_THRESHOLD = 40.0  # TODO: sesuaikan berdasarkan hasil testing
+
+        if avg_distance > DISTANCE_THRESHOLD:
+            return jsonify({
+                "error": "unrecognized",
+                "message": "Gambar tidak dikenali sebagai daun tanaman. Pastikan foto menampilkan daun dengan jelas.",
+                "avg_distance": round(avg_distance, 2)
+            }), 200
+
         # Predict
         prediction = model.predict(features)[0]
 
