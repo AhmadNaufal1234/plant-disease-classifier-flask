@@ -1,328 +1,129 @@
-"use client";
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 
-import { useRef, useState } from "react";
-import { Camera, ImageIcon, Leaf, AlertCircle, Loader2 } from "lucide-react";
+import cv2
+import joblib
+import numpy as np
+import sys
 
-import { Card, CardContent } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
+from pathlib import Path
 
-const diseaseInfo: Record<string, any> = {
-  bacterial_spot: {
-    name: "Bercak Bakteri",
-    solution: [
-      "Pangkas daun yang terinfeksi",
-      "Gunakan fungisida berbahan tembaga",
-      "Kurangi kelembapan berlebih",
-    ],
-  },
+app = Flask(__name__)
+CORS(app)
 
-  early_blight: {
-    name: "Busuk Daun Awal",
-    solution: [
-      "Buang daun yang terserang",
-      "Gunakan fungisida sesuai dosis",
-      "Jaga sirkulasi udara tanaman",
-    ],
-  },
+# ==========================
+# PATH SETUP
+# ==========================
+BASE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BASE_DIR.parent
 
-  late_blight: {
-    name: "Busuk Daun Lanjut",
-    solution: [
-      "Segera pisahkan tanaman sakit",
-      "Semprot fungisida secara berkala",
-      "Kurangi penyiraman berlebihan",
-    ],
-  },
+sys.path.append(str(PROJECT_ROOT))
+sys.path.append(str(PROJECT_ROOT / "ml" / "scripts"))
 
-  leaf_mold: {
-    name: "Jamur Daun",
-    solution: [
-      "Kurangi kelembapan lingkungan",
-      "Pangkas daun yang terinfeksi",
-      "Gunakan fungisida antijamur",
-    ],
-  },
+from ml.core.evaluation import run_evaluation
+from extractor import extract_features  # fungsi ekstraksi yang SAMA dengan training
 
-  healthy: {
-    name: "Tanaman Sehat",
-    solution: [
-      "Tanaman dalam kondisi baik",
-      "Lanjutkan perawatan rutin",
-      "Pantau kondisi daun secara berkala",
-    ],
-  },
-};
+# ==========================
+# LOAD MODEL
+# ==========================
+MODEL_PATH = PROJECT_ROOT / "ml" / "models" / "knn_model.pkl"
+SCALER_PATH = PROJECT_ROOT / "ml" / "models" / "scaler.pkl"
 
-export default function DeteksiPage() {
-  const [image, setImage] = useState<string | null>(null);
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [result, setResult] = useState<any>(null);
-  const [loading, setLoading] = useState(false);
+model = joblib.load(MODEL_PATH)
+scaler = joblib.load(SCALER_PATH)
 
-  const cameraInputRef = useRef<HTMLInputElement>(null);
-  const galleryInputRef = useRef<HTMLInputElement>(null);
+# ==========================
+# PREDICT
+# ==========================
+@app.route("/predict", methods=["POST"])
+def predict():
+    try:
+        if "image" not in request.files:
+            return jsonify({"error": "image not found"}), 400
 
-  const handleImage = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
+        file = request.files["image"]
 
-    if (!file) return;
+        image_bytes = np.frombuffer(file.read(), np.uint8)
+        image = cv2.imdecode(image_bytes, cv2.IMREAD_COLOR)
 
-    const reader = new FileReader();
+        if image is None:
+            return jsonify({"error": "invalid image"}), 400
 
-    reader.onloadend = () => {
-      setImage(reader.result as string);
-    };
+        # extract_features() sudah handle resize (160x160) + segmentasi daun
+        # di dalamnya sendiri — TIDAK perlu resize manual di sini lagi
+        features = np.array([extract_features(image)])
 
-    reader.readAsDataURL(file);
+        features = scaler.transform(features)
 
-    setSelectedFile(file);
-    setResult(null);
-  };
+        # ==========================
+        # CEK JARAK KE TETANGGA TERDEKAT
+        # Kalau gambar terlalu "asing" dibanding data training
+        # (misal bukan daun sama sekali), tolak prediksi.
+        # ==========================
+        distances, _ = model.kneighbors(features)
+        avg_distance = float(np.mean(distances))
 
-  const handlePredict = async () => {
-    if (!selectedFile) {
-      alert("Pilih gambar terlebih dahulu");
-      return;
-    }
+        DISTANCE_THRESHOLD = 40.0  # TODO: sesuaikan berdasarkan hasil testing
 
-    try {
-      setLoading(true);
+        if avg_distance > DISTANCE_THRESHOLD:
+            return jsonify({
+                "error": "unrecognized",
+                "message": "Gambar tidak dikenali sebagai daun tanaman. Pastikan foto menampilkan daun dengan jelas.",
+                "avg_distance": round(avg_distance, 2)
+            }), 200
 
-      const formData = new FormData();
-      formData.append("image", selectedFile);
+        # Predict
+        prediction = model.predict(features)[0]
 
-      const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/predict`, {
-        method: "POST",
-        body: formData,
-      });
+        # Confidence
+        probabilities = model.predict_proba(features)
+        confidence = float(np.max(probabilities) * 100)
 
-      const data = await response.json();
+        # Split label
+        parts = prediction.split("_", 1)
+        plant = parts[0]
+        disease = parts[1] if len(parts) > 1 else "unknown"
 
-      // Backend menolak gambar yang tidak dikenali (bukan daun / out-of-distribution)
-      if (data.error === "unrecognized") {
-        alert(data.message || "Gambar tidak dikenali sebagai daun tanaman.");
-        setResult(null);
-        return;
-      }
+        return jsonify({
+            "plant": plant,
+            "disease": disease,
+            "confidence": round(confidence, 2)
+        })
 
-      // Error lain dari backend (misal gambar invalid, dsb)
-      if (data.error) {
-        alert(data.error);
-        setResult(null);
-        return;
-      }
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-      setResult(data);
 
-      // SIMPAN KE RIWAYAT
-      const history = JSON.parse(
-        localStorage.getItem("detectionHistory") || "[]"
-      );
+# ==========================
+# HOME
+# ==========================
+@app.route("/")
+def home():
+    return jsonify({"message": "AgroScan AI API Running"})
 
-      history.unshift({
-        date: new Date().toLocaleString("id-ID"),
-        plant: data.plant,
-        disease: data.disease,
-        confidence: data.confidence,
-        image: image,
-      });
 
-      localStorage.setItem("detectionHistory", JSON.stringify(history));
-    } catch (error) {
-      console.error(error);
-      alert("Gagal melakukan prediksi");
-    } finally {
-      setLoading(false);
-    }
-  };
+# ==========================
+# EVALUATE MODEL
+# ==========================
+@app.route("/evaluate", methods=["POST"])
+def evaluate():
+    try:
+        data = request.get_json()
+        k = int(data["k"])
+        split = data["split"]
 
-  const info =
-    result && diseaseInfo[result.disease] ? diseaseInfo[result.disease] : null;
+        csv_path = PROJECT_ROOT / "ml" / "features" / "train_features.csv"
 
-  return (
-    <div className="max-w-md mx-auto p-4 pb-32">
-      <div className="mb-6">
-        <h1 className="text-3xl font-bold tracking-tight">
-          Deteksi Penyakit
-        </h1>
-        <p className="text-sm text-muted-foreground mt-1">
-          Foto atau unggah gambar daun untuk dianalisis
-        </p>
-      </div>
+        result = run_evaluation(csv_path=csv_path, k=k, split=split)
 
-      {/* Upload */}
-      <Card className="mb-4 shadow-sm border-0 rounded-3xl">
-        <CardContent className="p-5">
-          {image ? (
-            <div className="relative">
-              <img
-                src={image}
-                alt="Preview"
-                className="rounded-2xl w-full h-64 object-cover"
-              />
-              <span className="absolute top-3 right-3 bg-black/50 text-white text-xs px-2.5 py-1 rounded-full backdrop-blur">
-                Preview
-              </span>
-            </div>
-          ) : (
-            <div className="h-64 border-2 border-dashed rounded-2xl flex items-center justify-center">
-              <div className="text-center px-6">
-                <div className="w-14 h-14 rounded-full bg-green-50 flex items-center justify-center mx-auto mb-4">
-                  <Leaf size={26} className="text-green-600" />
-                </div>
+        return jsonify(result)
 
-                <p className="font-medium">Belum ada gambar</p>
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-                <p className="text-sm text-muted-foreground mt-1">
-                  Ambil foto langsung atau pilih dari galeri
-                </p>
-              </div>
-            </div>
-          )}
 
-          {/* Input tersembunyi — terpisah untuk kamera & galeri */}
-          <input
-            ref={cameraInputRef}
-            type="file"
-            accept="image/*"
-            capture="environment"
-            onChange={handleImage}
-            className="hidden"
-          />
-
-          <input
-            ref={galleryInputRef}
-            type="file"
-            accept="image/*"
-            onChange={handleImage}
-            className="hidden"
-          />
-
-          <div className="grid grid-cols-2 gap-3 mt-4">
-            <Button
-              type="button"
-              variant="outline"
-              className="w-full"
-              onClick={() => cameraInputRef.current?.click()}
-            >
-              <Camera className="mr-2 h-4 w-4" />
-              Ambil Foto
-            </Button>
-
-            <Button
-              type="button"
-              variant="outline"
-              className="w-full"
-              onClick={() => galleryInputRef.current?.click()}
-            >
-              <ImageIcon className="mr-2 h-4 w-4" />
-              Pilih Galeri
-            </Button>
-          </div>
-
-          <Button
-            onClick={handlePredict}
-            disabled={loading || !selectedFile}
-            className="w-full mt-3 bg-green-600 hover:bg-green-700 disabled:opacity-50"
-          >
-            {loading ? (
-              <>
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                Menganalisis...
-              </>
-            ) : (
-              "Deteksi Penyakit"
-            )}
-          </Button>
-        </CardContent>
-      </Card>
-
-      {/* Hasil Prediksi */}
-      <Card className="shadow-sm border-0 rounded-3xl">
-        <CardContent className="p-5">
-          <div className="flex items-center gap-2 mb-5">
-            <Leaf className="text-green-600" />
-            <h2 className="font-bold text-xl">Hasil Analisis</h2>
-          </div>
-
-          {result && result.plant ? (
-            <div className="space-y-5">
-              {/* Badge Tanaman */}
-              <div>
-                <span
-                  className="
-                    inline-flex
-                    px-3
-                    py-1
-                    rounded-full
-                    text-xs
-                    font-medium
-                    bg-green-100
-                    text-green-700
-                  "
-                >
-                  {result.plant.charAt(0).toUpperCase() +
-                    result.plant.slice(1)}
-                </span>
-              </div>
-
-              {/* Nama Penyakit */}
-              <div>
-                <h3 className="text-2xl font-bold leading-tight">
-                  {info?.name || result.disease}
-                </h3>
-              </div>
-
-              {/* Confidence */}
-              <div>
-                <div className="flex justify-between mb-2">
-                  <span className="text-sm text-muted-foreground">
-                    Tingkat Kepercayaan
-                  </span>
-
-                  <span className="font-bold text-green-600">
-                    {result.confidence}%
-                  </span>
-                </div>
-
-                <div className="w-full h-2 rounded-full bg-gray-200 overflow-hidden">
-                  <div
-                    className="h-full bg-green-500 transition-all duration-700 ease-out"
-                    style={{ width: `${result.confidence}%` }}
-                  />
-                </div>
-              </div>
-
-              {/* Solusi */}
-              {info && (
-                <div className="bg-green-50 border border-green-100 rounded-2xl p-4">
-                  <h4 className="font-semibold text-green-700 mb-3">
-                    Rekomendasi Penanganan
-                  </h4>
-
-                  <ul className="list-disc ml-5 space-y-2 text-sm">
-                    {info.solution.map((item: string, index: number) => (
-                      <li key={index}>{item}</li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-            </div>
-          ) : (
-            <div className="text-center py-10">
-              <AlertCircle size={42} className="mx-auto mb-3 text-gray-400" />
-
-              <p className="font-medium text-gray-500">
-                Belum ada hasil analisis
-              </p>
-
-              <p className="text-sm text-gray-400 mt-1">
-                Upload gambar daun terlebih dahulu
-              </p>
-            </div>
-          )}
-        </CardContent>
-      </Card>
-    </div>
-  );
-}
+# ==========================
+# RUN
+# ==========================
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=5000)
